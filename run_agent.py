@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from simulation.simulator import Simulator
 
 from core.logger import ActionLogger
 from core.memory import MemoryStore
 from core.config import MonitorConfig, AnalystConfig, PlannerConfig, ExecutorConfig
+from core.telemetry import TelemetryLogger
 
 from agents.monitor import MonitorAgent
 from agents.analyst import AnalystAgent
@@ -58,6 +60,7 @@ def main() -> None:
     # --- Core services ---
     logger = ActionLogger(path="logs/actions.jsonl")
     memory = MemoryStore(path="memory/aiops_memory.jsonl")
+    telemetry = TelemetryLogger(metrics_path="logs/metrics.jsonl", incidents_path="logs/incidents.jsonl")
 
     # --- Agent configs ---
     mon_cfg = MonitorConfig()
@@ -78,7 +81,6 @@ def main() -> None:
     cluster_state: Dict[str, Any] = {
         "replicas": 2,
         "version": "v1",
-        # helps restart logic if your sim/executor uses it
         "service_health": "ok",
     }
 
@@ -87,15 +89,15 @@ def main() -> None:
         print(f"Scenario enabled: {args.scenario}")
 
     while True:
-        # 1) OBSERVE: get next metrics from simulator
-        tick = sim.step(cluster_state=cluster_state)  # tick is a MetricPoint-like object (attributes)
+        # 1) OBSERVE
+        tick = sim.step(cluster_state=cluster_state)
 
         cpu = float(tick.cpu)
         mem = float(tick.mem)
         lat_ms = float(tick.lat_ms)
         err = float(tick.err)
 
-        # Update state from simulator tick (authoritative)
+        # Sync state from simulator tick
         cluster_state["replicas"] = int(getattr(tick, "replicas", cluster_state["replicas"]))
         cluster_state["version"] = str(getattr(tick, "version", cluster_state["version"]))
 
@@ -109,10 +111,22 @@ def main() -> None:
             version=str(cluster_state["version"]),
         )
 
-        # Dict version for anything that wants it (analyst.latest)
         latest_metrics = point.metrics
 
-        # Print baseline metrics (your current output style)
+        # Structured tick logging (replayable)
+        telemetry.log_metric(
+            {
+                "cpu": cpu,
+                "mem": mem,
+                "lat_ms": lat_ms,
+                "err": err,
+                "replicas": cluster_state["replicas"],
+                "version": cluster_state["version"],
+                "scenario": args.scenario,
+            }
+        )
+
+        # Print baseline metrics
         print(
             f"CPU={cpu:.0f}  MEM={mem:.0f}  "
             f"LAT(ms)={lat_ms:.0f}  ERR={err:.0f}  "
@@ -135,13 +149,35 @@ def main() -> None:
                 f"abnormal={abnormal_keys} reason={getattr(anomaly, 'reason', 'n/a')}"
             )
 
-        # 3-6 pipeline only if anomaly
         if anomaly.is_anomaly:
+            incident_id = str(uuid.uuid4())[:8]
+
+            telemetry.log_incident(
+                {
+                    "incident_id": incident_id,
+                    "stage": "detect",
+                    "anomaly_score": anomaly.anomaly_score,
+                    "abnormal_metrics": list(getattr(anomaly, "abnormal_metrics", {}).keys()),
+                    "reason": getattr(anomaly, "reason", None),
+                    "cluster_state_before": dict(cluster_state),
+                }
+            )
+
             # 3) ANALYZE
             analysis = analyst.analyze(anomaly, latest=latest_metrics)
             top = analysis.hypotheses[0]
             print(f"[ANALYST] {analysis.summary}")
             print(f"[ANALYST] top={top.name} likelihood={top.likelihood:.2f} evidence={top.evidence}")
+
+            telemetry.log_incident(
+                {
+                    "incident_id": incident_id,
+                    "stage": "analyze",
+                    "top_hypothesis": top.name,
+                    "likelihood": top.likelihood,
+                    "evidence": top.evidence,
+                }
+            )
 
             # 4) DECIDE
             decision = planner.plan(analysis)
@@ -150,9 +186,31 @@ def main() -> None:
                 f"risk={decision.risk:.2f} rationale={decision.rationale}"
             )
 
+            telemetry.log_incident(
+                {
+                    "incident_id": incident_id,
+                    "stage": "decide",
+                    "action": decision.action,
+                    "confidence": decision.confidence,
+                    "risk": decision.risk,
+                    "rationale": decision.rationale,
+                }
+            )
+
             # 5) ACT
             result = executor.execute(decision, cluster_state=cluster_state)
             print(f"[EXECUTOR] action={result.action} success={result.success} outcome={result.outcome}")
+
+            telemetry.log_incident(
+                {
+                    "incident_id": incident_id,
+                    "stage": "act",
+                    "action": result.action,
+                    "success": result.success,
+                    "outcome": result.outcome,
+                    "cluster_state_after": dict(cluster_state),
+                }
+            )
 
             # 6) LEARN
             sig = AnalystAgent.signature(anomaly)
@@ -162,6 +220,7 @@ def main() -> None:
                 success=result.success,
                 outcome=result.outcome,
                 metadata={
+                    "incident_id": incident_id,
                     "scenario": args.scenario,
                     "anomaly_score": anomaly.anomaly_score,
                     "abnormal_metrics": getattr(anomaly, "abnormal_metrics", {}),

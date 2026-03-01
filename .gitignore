@@ -215,3 +215,17 @@ memory/
 # Virtual environments
 venv/
 .env
+# runtime logs
+logs/*.jsonl
+memory/*.jsonl
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# environment
+.env
