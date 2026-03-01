@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Runtime data
+logs/
+memory/
+
+# Mac system files
+.DS_Store
+
+# Virtual environments
+venv/
+.env
